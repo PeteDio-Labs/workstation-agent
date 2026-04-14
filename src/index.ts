@@ -11,22 +11,61 @@
 import express from 'express';
 import pino from 'pino';
 import { z } from 'zod';
-import { AgentReporter, runToolLoop } from '@petedio/shared/agents';
-import { TaskPayloadSchema } from '@petedio/shared/agents';
 import { WorkstationAgentInputSchema } from './schema.js';
-import { buildTools } from './tools.js';
+import { buildPlan, executeStep, formatReport, type WorkstationStep, type WorkstationStepLog } from './tools.js';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 const PORT = parseInt(process.env.PORT ?? '3008', 10);
-const OLLAMA_URL = process.env.OLLAMA_URL ?? 'http://192.168.50.59:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'gemma4';
 const MC_BACKEND_URL = process.env.MC_BACKEND_URL ?? 'http://localhost:3000';
+const SHARED_AGENTS_MODULE_PATH = process.env.SHARED_AGENTS_MODULE_PATH ?? '@petedio/shared/agents';
+
+interface SharedAgentReporter {
+  running(message: string): Promise<void>;
+  complete(result: {
+    taskId: string;
+    agentName: string;
+    status: 'complete';
+    summary: string;
+    artifacts: Array<{ type: 'log'; label: string; content: string }>;
+    durationMs: number;
+    completedAt: string;
+  }): Promise<void>;
+  fail(message: string): Promise<void>;
+}
+
+interface SharedAgentsModule {
+  AgentReporter: new (opts: { mcUrl: string; taskId: string; agentName: string }) => SharedAgentReporter;
+  TaskPayloadSchema: z.ZodType<{
+    taskId: string;
+    agentName: string;
+    trigger: string;
+    input: Record<string, unknown>;
+    issuedAt: string;
+  }>;
+  runDeterministicPlan: (opts: {
+    steps: WorkstationStep[];
+    executeStep: (step: WorkstationStep) => Promise<string>;
+    onStepStart?: (step: WorkstationStep, index: number) => void | Promise<void>;
+    stopOnError?: boolean;
+  }) => Promise<{
+    status: 'complete' | 'failed';
+    logs: WorkstationStepLog[];
+    completedSteps: number;
+    failedStep?: WorkstationStepLog;
+  }>;
+}
+
+async function loadSharedAgents(): Promise<SharedAgentsModule> {
+  return import(SHARED_AGENTS_MODULE_PATH) as Promise<SharedAgentsModule>;
+}
 
 // ─── Agent Logic ─────────────────────────────────────────────────
 
-async function runTask(payload: z.infer<typeof TaskPayloadSchema>): Promise<void> {
+async function runTask(payload: { taskId: string; input: Record<string, unknown> }): Promise<void> {
   const startMs = Date.now();
   const input = WorkstationAgentInputSchema.parse(payload.input);
+  const shared = await loadSharedAgents();
+  const { AgentReporter, runDeterministicPlan } = shared;
 
   const reporter = new AgentReporter({
     mcUrl: MC_BACKEND_URL,
@@ -34,51 +73,42 @@ async function runTask(payload: z.infer<typeof TaskPayloadSchema>): Promise<void
     agentName: 'workstation-agent',
   });
 
-  await reporter.running('Executing workstation task...');
+  await reporter.running(`Executing workstation task (${input.mode})...`);
   log.info({ taskId: payload.taskId, input }, 'workstation-agent starting');
 
-  const gateNote = input.gated
-    ? 'Gated mode is ENABLED — write_file, git_commit, git_push, and systemd_restart are available.'
-    : 'Gated mode is DISABLED — only read-only and non-destructive tools are available.';
-
-  const userPrompt = `
-Task: ${input.task}
-
-Working directory: ${input.workDir}
-${gateNote}
-
-Complete the task using the available tools. When done, summarise what was accomplished and any relevant output or findings.
-`.trim();
+  const steps = buildPlan(input);
 
   try {
-    const { finalResponse, toolCallLog, iterations } = await runToolLoop({
-      ollamaUrl: OLLAMA_URL,
-      model: OLLAMA_MODEL,
-      system: 'You are a workstation automation agent running on LXC 113. Execute tasks efficiently using the available tools. For destructive operations, only proceed if gated mode is enabled.',
-      userPrompt,
-      tools: buildTools(input.gated, input.workDir),
-      onIteration: (i, content) => {
-        if (content) log.info({ taskId: payload.taskId, iteration: i }, 'loop response');
+    const result = await runDeterministicPlan({
+      steps,
+      executeStep: (step) => executeStep(step, { gated: input.gated, workDir: input.workDir }),
+      onStepStart: async (step, index) => {
+        await reporter.running(`Step ${index + 1}/${steps.length}: ${step.title}`);
       },
     });
 
     const durationMs = Date.now() - startMs;
-    log.info({ taskId: payload.taskId, iterations, durationMs }, 'task complete');
+    const report = formatReport(result.logs);
+    const summary = result.failedStep
+      ? `Failed at ${result.failedStep.step.title}`
+      : `Completed ${result.completedSteps} workstation step(s)`;
+    log.info({ taskId: payload.taskId, durationMs, steps: result.logs.length, status: result.status }, 'task complete');
 
-    const toolSummary = toolCallLog.length > 0
-      ? `\n\n---\n**Tools used:** ${[...new Set(toolCallLog.map(t => t.tool))].join(', ')}`
-      : '';
+    if (result.status === 'failed') {
+      await reporter.fail(`${summary}\n\n${report}`);
+      return;
+    }
 
     await reporter.complete({
       taskId: payload.taskId,
       agentName: 'workstation-agent',
       status: 'complete',
-      summary: firstLine(finalResponse),
+      summary,
       artifacts: [
         {
           type: 'log',
           label: 'Workstation Task Report',
-          content: finalResponse + toolSummary,
+          content: report,
         },
       ],
       durationMs,
@@ -91,14 +121,13 @@ Complete the task using the available tools. When done, summarise what was accom
   }
 }
 
-function firstLine(text: string): string {
-  return text.split('\n').find(l => l.trim().length > 0) ?? text.slice(0, 100);
-}
-
 // ─── HTTP Server ──────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
+
+const shared = await loadSharedAgents();
+const { TaskPayloadSchema } = shared;
 
 // MC Backend POSTs here to dispatch a task
 app.post('/run', async (req, res) => {
@@ -117,9 +146,9 @@ app.post('/run', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', agent: 'workstation-agent', model: OLLAMA_MODEL });
+  res.json({ status: 'ok', agent: 'workstation-agent', sharedAgentsModulePath: SHARED_AGENTS_MODULE_PATH });
 });
 
 app.listen(PORT, () => {
-  log.info({ port: PORT, model: OLLAMA_MODEL }, 'workstation-agent listening');
+  log.info({ port: PORT, sharedAgentsModulePath: SHARED_AGENTS_MODULE_PATH }, 'workstation-agent listening');
 });
