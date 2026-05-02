@@ -25,6 +25,9 @@ const BLOCKED_PATTERNS = [
   /:\(\)\s*\{.*:\|:/,
 ];
 
+const GREP_REPLACE_CATCHALL = [/^\.\*$/, /^\.\+$/, /^\.\+@\.\+$/];
+const GREP_REPLACE_MAX_FILES = 50;
+
 const ALLOWED_SYSTEMD_UNITS = [
   'ops-investigator',
   'pm-agent',
@@ -97,6 +100,112 @@ async function writeFile(path: string, content: string): Promise<string> {
   }
 }
 
+function checkGrepPattern(pattern: string): string | null {
+  if (pattern.length < 4) {
+    return `Refused: pattern length < 4 chars ("${pattern}"). Use a more specific pattern.`;
+  }
+  if (/^[\s./]*$/.test(pattern)) {
+    return `Refused: pattern is whitespace/dots/slashes only. Use a more specific pattern.`;
+  }
+  for (const re of GREP_REPLACE_CATCHALL) {
+    if (re.test(pattern)) {
+      return `Refused: pattern is too broad ("${pattern}"). Use a more specific pattern.`;
+    }
+  }
+  if (pattern.includes('/')) {
+    return `Refused: pattern must not contain '/' (used as sed delimiter). Replace '/' with '\\/' in the regex if needed.`;
+  }
+  return null;
+}
+
+async function findGrepMatches(pattern: string, pathGlob: string | undefined, cwd: string): Promise<string[]> {
+  const args: string[] = ['rg', '-l', '--null', pattern];
+  if (pathGlob && pathGlob.trim().length > 0) {
+    const parts = pathGlob.split(/\s+/).filter(Boolean);
+    args.push(...parts);
+  }
+  const proc = Bun.spawn(args, { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const [out, errOut, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode === 0) {
+    return out.split('\0').map(s => s.trim()).filter(Boolean);
+  }
+  if (exitCode === 1) {
+    return [];
+  }
+  throw new Error(`rg failed (exit ${exitCode}): ${errOut.trim() || '(no stderr)'}`);
+}
+
+async function applySedReplacements(
+  files: string[],
+  pattern: string,
+  replacement: string,
+  cwd: string,
+): Promise<string> {
+  const escapedReplacement = replacement
+    .replace(/\\/g, '\\\\')
+    .replace(/\//g, '\\/')
+    .replace(/&/g, '\\&');
+  const sedExpr = `s/${pattern}/${escapedReplacement}/g`;
+
+  const results: string[] = [];
+  for (const file of files) {
+    const proc = Bun.spawn(['sed', '-i', '-E', '-e', sedExpr, file], {
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [errOut, exitCode] = await Promise.all([
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    results.push(exitCode === 0 ? `OK ${file}` : `FAILED ${file}: ${errOut.trim() || `exit ${exitCode}`}`);
+  }
+  return results.join('\n');
+}
+
+async function grepReplace(
+  args: { pattern: string; replacement?: string; pathGlob?: string; dryRun: boolean; gated: boolean; cwd: string },
+): Promise<string> {
+  const patternErr = checkGrepPattern(args.pattern);
+  if (patternErr) return patternErr;
+
+  let files: string[];
+  try {
+    files = await findGrepMatches(args.pattern, args.pathGlob, args.cwd);
+  } catch (err) {
+    return `Error running ripgrep: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  const header = `Pattern: ${args.pattern}\nPath: ${args.pathGlob ?? '(repo root)'}\nMatched ${files.length} file(s).`;
+
+  if (files.length === 0) {
+    return `${header}\n(no matches)`;
+  }
+
+  if (args.dryRun) {
+    return `${header}\n${files.join('\n')}`;
+  }
+
+  if (!args.gated) {
+    return `${header}\nRefused: apply requires gated=true. Currently dryRun=false but gated=false.`;
+  }
+
+  if (files.length > GREP_REPLACE_MAX_FILES) {
+    return `${header}\nRefused: matched files (${files.length}) exceeds circuit-breaker max (${GREP_REPLACE_MAX_FILES}). Narrow the pathGlob and re-run.`;
+  }
+
+  if (args.replacement === undefined) {
+    return `${header}\nRefused: apply requires replacement.`;
+  }
+
+  const replaceLog = await applySedReplacements(files, args.pattern, args.replacement, args.cwd);
+  return `${header}\nReplacement: ${args.replacement}\n\n${replaceLog}`;
+}
+
 export function buildPlan(input: WorkstationAgentInput): WorkstationStep[] {
   switch (input.mode) {
     case 'inspect-repo':
@@ -118,6 +227,19 @@ export function buildPlan(input: WorkstationAgentInput): WorkstationStep[] {
       return [{ title: `Write ${input.path}`, action: 'write-file', args: { path: input.path, content: input.content } }];
     case 'systemd-restart':
       return [{ title: `Restart ${input.unit}`, action: 'systemd-restart', args: { unit: input.unit } }];
+    case 'grep-replace':
+      return [{
+        title: input.dryRun
+          ? `Find files matching ${input.pattern}`
+          : `Replace ${input.pattern} → ${input.replacement} in matched files`,
+        action: 'grep-replace',
+        args: {
+          pattern: input.pattern,
+          replacement: input.replacement,
+          pathGlob: input.pathGlob,
+          dryRun: input.dryRun,
+        },
+      }];
     case 'command':
     default:
       return [{ title: `Run command`, action: 'command', args: { command: input.command ?? input.task } }];
@@ -158,6 +280,13 @@ export async function executeStep(step: WorkstationStep, opts: { gated: boolean;
         return `Blocked: '${unitName}' is not in the allowed unit list (${ALLOWED_SYSTEMD_UNITS.join(', ')})`;
       }
       return spawnCommand(`systemctl restart ${unitName}.service`, workDir);
+    }
+    case 'grep-replace': {
+      const pattern = String(step.args?.pattern ?? '');
+      const replacement = step.args?.replacement === undefined ? undefined : String(step.args.replacement);
+      const pathGlob = step.args?.pathGlob === undefined ? undefined : String(step.args.pathGlob);
+      const dryRun = step.args?.dryRun !== false;
+      return grepReplace({ pattern, replacement, pathGlob, dryRun, gated, cwd: workDir });
     }
   }
 }
