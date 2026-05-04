@@ -10,6 +10,7 @@ export const WorkstationModeSchema = z.enum([
   'read-file',
   'write-file',
   'systemd-restart',
+  'grep-replace',
 ]);
 
 export const WorkstationAgentInputSchema = z.object({
@@ -29,12 +30,20 @@ export const WorkstationAgentInputSchema = z.object({
     .describe('kubectl resource selector for kubectl-get mode'),
   unit: z.string().optional()
     .describe('systemd unit for systemd-restart mode'),
+  pattern: z.string().optional()
+    .describe('Regex pattern for grep-replace mode'),
+  replacement: z.string().optional()
+    .describe('Replacement string for grep-replace mode'),
+  pathGlob: z.string().optional()
+    .describe('Path glob (relative to workDir) to limit grep-replace blast radius'),
+  dryRun: z.boolean().default(true)
+    .describe('When true, grep-replace only lists matching files; default true'),
   gitLogCount: z.coerce.number().int().positive().default(10)
     .describe('Number of commits to show for git-log mode'),
   workDir: z.string().default('/home/pedro/PeteDio-Labs')
     .describe('Working directory for shell commands and file operations'),
   gated: z.boolean().default(false)
-    .describe('Enable gated (destructive) tools: write_file, git_commit, git_push, systemd_restart'),
+    .describe('Enable gated (destructive) tools: write_file, git_commit, git_push, systemd_restart, grep-replace apply'),
 }).superRefine((input, ctx) => {
   if (input.mode === 'command' && !input.command && !input.task) {
     ctx.addIssue({ code: 'custom', message: 'command mode requires command or task' });
@@ -53,6 +62,14 @@ export const WorkstationAgentInputSchema = z.object({
   }
   if (input.mode === 'systemd-restart' && !input.unit) {
     ctx.addIssue({ code: 'custom', message: 'systemd-restart mode requires unit' });
+  }
+  if (input.mode === 'grep-replace') {
+    if (!input.pattern) {
+      ctx.addIssue({ code: 'custom', message: 'grep-replace mode requires pattern' });
+    }
+    if (input.dryRun === false && input.replacement === undefined) {
+      ctx.addIssue({ code: 'custom', message: 'grep-replace apply requires replacement' });
+    }
   }
 });
 
