@@ -30,7 +30,6 @@ const GREP_REPLACE_MAX_FILES = 50;
 
 const ALLOWED_SYSTEMD_UNITS = [
   'ops-investigator',
-  'pm-agent',
   'knowledge-janitor',
   'workstation-agent',
   'infra-agent',
